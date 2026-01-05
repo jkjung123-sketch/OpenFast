@@ -116,4 +116,3 @@ jobs:
             - runs/rosco/IEA-15-240-RWT-Monopile/*.out*
             - runs/rosco/IEA-15-240-RWT-Monopile/openfast.log
             - results/openfast_summary.md
-``
