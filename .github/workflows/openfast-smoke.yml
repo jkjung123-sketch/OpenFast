@@ -1,0 +1,131 @@
+name: openfast-smoke
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/openfast-smoke.yml"
+
+jobs:
+  run-openfast-iea15mw:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # Conda/Mamba 환경을 세팅하고 conda-forge의 openfast를 설치합니다.
+      # (공식 문서 및 릴리스에서 conda-forge 사용을 안내) 
+      # refs: OpenFAST docs / releases
+      - name: Set up Mambaforge
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          activate-environment: of_env
+          python-version: "3.10"
+          auto-activate-base: false
+
+      - name: Install OpenFAST & tools (conda-forge)
+        shell: bash -l {0}
+        run: |
+          mamba install -y -c conda-forge openfast pandas numpy
+          openfast --version
+
+      # IEA-15MW 모델을 공식 저장소에서 가져옵니다. (Monopile 케이스 사용)
+      # refs: IEA-15-240-RWT
+      - name: Fetch IEA-15MW model
+        shell: bash -l {0}
+        run: |
+          mkdir -p models
+          git clone --depth=1 https://github.com/IEAWindSystems/IEA-15-240-RWT models/IEA-15-240-RWT
+
+      # ROSCO 컨트롤러의 Bladed-style DISCON(.so)을 릴리스 자산에서 가져옵니다.
+      # ServoDyn은 DLL_FileName/DLL_InFile로 DISCON 사용 (Bladed 인터페이스) 
+      # refs: ROSCO docs / Standard Workflow
+      - name: Get ROSCO libdiscon (Linux .so)
+        shell: bash -l {0}
+        run: |
+          mkdir -p controllers/bin
+          wget -qO controllers/bin/libdiscon.so \
+            https://github.com/NREL/ROSCO/releases/latest/download/libdiscon.so || \
+          (echo "Could not fetch ROSCO libdiscon.so. Please pin a version in this step." && exit 1)
+          chmod +x controllers/bin/libdiscon.so
+
+      # 케이스 준비: 모델 사본을 runs/rosco로 복사하고 ServoDyn의 DLL 경로를 설정
+      - name: Prepare IEA-15MW Monopile case for ROSCO
+        shell: bash -l {0}
+        run: |
+          mkdir -p runs/rosco
+          cp -r models/IEA-15-240-RWT/OpenFAST/IEA-15-240-RWT-Monopile runs/rosco/
+          SD="runs/rosco/IEA-15-240-RWT-Monopile_ServoDyn.dat"
+          # DLL_FileName/DLL_InFile 교체 (IEA 저장소의 DISCON.IN 파일명 그대로 사용)
+          sed -i 's|DLL_FileName.*|\"../../controllers/bin/libdiscon.so\"    DLL_FileName|' "$SD"
+          sed -i 's|DLL_InFile.*|\"IEA-15-240-RWT-Monopile_DISCON.IN\"        DLL_InFile|' "$SD"
+
+      # OpenFAST 실행
+      - name: Run OpenFAST (IEA-15MW Monopile with ROSCO)
+        shell: bash -l {0}
+        working-directory: runs/rosco/IEA-15-240-RWT-Monopile
+        run: |
+          set -e
+          echo ">>> Running OpenFAST ..."
+          openfast IEA-15-240-RWT-Monopile.fst | tee openfast.log
+          echo ">>> Done."
+
+      # 간단 요약(MD) 생성: 전력 평균과 시간 길이만 출력 (심층 분석은 추후 확장)
+      - name: Summarize outputs
+        shell: bash -l {0}
+        run: |
+          python - << 'PY'
+          import glob, pandas as pd, os
+          outs = glob.glob("runs/rosco/IEA-15-240-RWT-Monopile/*.out*")
+          # 텍스트 .out 우선 처리 (툴박스 없이 헤더/데이터 파싱)
+          def read_text_out(f):
+              with open(f,"r",encoding="utf-8",errors="ignore") as fh:
+                  lines = fh.readlines()
+              ix = None
+              for i,l in enumerate(lines):
+                  if l.strip().startswith("Time"):
+                      ix=i
+              if ix is None: 
+                  return None
+              cols = lines[ix].split()
+              data=[]
+              for l in lines[ix+1:]:
+                  if not l.strip(): break
+                  parts = l.split()
+                  try:
+                      data.append([float(x) for x in parts])
+                  except:
+                      break
+              return pd.DataFrame(data, columns=cols)
+          df=None
+          for f in outs:
+              if f.endswith(".out") or f.endswith(".outb")==False:
+                  df = read_text_out(f)
+                  if df is not None: break
+          os.makedirs("results", exist_ok=True)
+          with open("results/openfast_summary.md","w") as fh:
+              fh.write("# OpenFAST Smoke Test (IEA-15MW Monopile)\n\n")
+              if df is None:
+                  fh.write("- 결과 요약을 생성할 .out 텍스트 파일을 찾지 못했습니다.\n")
+              else:
+                  cols = df.columns
+                  pcol = [c for c in cols if "GenPwr" in c]
+                  T = df["Time_[s]"].iloc[-1] if "Time_[s]" in cols else None
+                  P = df[pcol[0]].mean() if pcol else None
+                  if T is not None: fh.write(f"- 시뮬레이션 시간(최종 Time): **{T:.1f} s**\n")
+                  if P is not None: fh.write(f"- 평균 전기출력(GenPwr): **{P:.1f} kW**\n")
+          print(open("results/openfast_summary.md","r").read())
+          PY
+
+      # 산출물 업로드
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: openfast-iea15mw-rosco
+          path: |
+            runs/rosco/IEA-15-240-RWT-Monopile/*.out*
+            runs/rosco/IEA-15-240-RWT-Monopile/openfast.log
+            results/openfast_summary.md
+``
